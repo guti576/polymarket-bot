@@ -1,0 +1,8 @@
+cd polymarket-bot
+git pull origin main
+source .venv/bin/activate
+rm bot_log.out
+Para lanzar en VPS y redirigir la salida: nohup python -u polymarket_collector_optimized.py > bot_log.log 2>&1 &
+Buscar el proceso: ps aux | grep bot.py
+Parar el proceso: kill XXXXXX
+Ver registro de logs: tail -n 100 nohup.out
