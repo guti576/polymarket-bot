@@ -6,3 +6,4 @@
 - Buscar el proceso: ps aux | grep bot.py
 - Parar el proceso: kill XXXXXX
 - Ver registro de logs: tail -n 100 nohup.out
+- Salir de .venv: deactivate
