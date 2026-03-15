@@ -20,7 +20,7 @@ from datetime import datetime
 # =========================
 # Configuration
 # =========================
-DATASET_FILE = "polymarket_pro_dataset.csv"
+DATASET_FILE = "./polymarket_pro_dataset.csv"
 BINANCE_URL = "https://data-api.binance.vision/api/v3/ticker/price?symbol=BTCUSDT"
 GAMMA_URL = "https://gamma-api.polymarket.com/events/slug"
 BOOK_URL = "https://clob.polymarket.com/book"
