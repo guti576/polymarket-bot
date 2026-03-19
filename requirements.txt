@@ -3,3 +3,6 @@ numpy
 xgboost
 scikit-learn
 matplotlib
+requests
+seaborn
+lightgbm
