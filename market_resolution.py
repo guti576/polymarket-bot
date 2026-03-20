@@ -4,8 +4,8 @@ import json
 import time
 
 # -------- CONFIG --------
-INPUT_FILE = "polymarket_dataset_full.csv"
-OUTPUT_FILE = "polymarket_pro_dataset_with_resolution.csv"
+INPUT_FILE = "polymarket_dataset_5m.csv"
+OUTPUT_FILE = "dataset_with_resolution.csv"
 API_URL = "https://gamma-api.polymarket.com/markets?slug="
 
 
