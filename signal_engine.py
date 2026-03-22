@@ -199,7 +199,12 @@ class IncrementalCSVReader:
         self._header_cols: list[str] | None = None
 
     def read_new(self) -> pd.DataFrame | None:
-        """Retorna DataFrame con filas nuevas, o None si no hay cambios."""
+        """Retorna DataFrame con filas nuevas, o None si no hay cambios.
+
+        Seguro ante escrituras concurrentes: si la última línea está
+        truncada (el writer está a mitad de flush), se descarta y el
+        offset se retrocede para releerla completa en el siguiente tick.
+        """
         try:
             file_size = os.path.getsize(self.path)
         except FileNotFoundError:
@@ -215,21 +220,31 @@ class IncrementalCSVReader:
                 self._header_cols = [c.strip() for c in self._header.strip().split(",")]
                 self._byte_offset = f.tell()
 
-                # Leer el resto del archivo
                 remaining = f.read()
                 if not remaining.strip():
                     return None
-                chunk = self._header + remaining
-                self._byte_offset = f.tell()
+                raw = remaining
             else:
-                # Lecturas posteriores: seek al offset y leer solo lo nuevo
                 f.seek(self._byte_offset)
-                new_data = f.read()
-                self._byte_offset = f.tell()
+                raw = f.read()
 
-                if not new_data.strip():
+                if not raw.strip():
                     return None
-                chunk = self._header + new_data
+
+            # Descartar última línea si no termina en \n (escritura parcial)
+            if not raw.endswith("\n"):
+                last_nl = raw.rfind("\n")
+                if last_nl == -1:
+                    # Solo hay una línea parcial — no consumir nada
+                    return None
+                truncated = raw[last_nl + 1:]
+                raw = raw[: last_nl + 1]
+                # Retroceder offset para releer la línea parcial
+                self._byte_offset += len(raw.encode("utf-8"))
+            else:
+                self._byte_offset += len(raw.encode("utf-8"))
+
+            chunk = self._header + raw
 
         df = pd.read_csv(
             StringIO(chunk),
