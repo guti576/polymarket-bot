@@ -9,6 +9,8 @@ Ver registro de logs: tail -n 100 nohup.out
 Salir de .venv: deactivate
 Traer fichero: scp root@116.203.230.26:~/polymarket-bot/polymarket_pro_dataset.csv .
 
+Run signal: python signal_engine.py --model-dir ./model --poll 1.0
+
 # Dataset Variables
 
 ## Market Metadata
