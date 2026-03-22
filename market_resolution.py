@@ -2,32 +2,41 @@ import pandas as pd
 import requests
 import json
 import time
+from tqdm import tqdm
 
 # -------- CONFIG --------
 INPUT_FILE = "polymarket_dataset_5m.csv"
 OUTPUT_FILE = "dataset_with_resolution.csv"
 API_URL = "https://gamma-api.polymarket.com/markets?slug="
 
+# Reutilizar conexión HTTP (mejor rendimiento)
+session = requests.Session()
 
-def get_market_resolution(slug):
-    try:
-        r = requests.get(API_URL + slug, timeout=10)
-        data = r.json()
 
-        if not data:
-            return None
+def get_market_resolution(slug, retries=3):
+    for attempt in range(retries):
+        try:
+            r = session.get(API_URL + slug, timeout=10)
+            r.raise_for_status()
+            data = r.json()
 
-        market = data[0]
+            if not data:
+                return None
 
-        outcomes = json.loads(market["outcomes"])
-        prices = list(map(float, json.loads(market["outcomePrices"])))
+            market = data[0]
 
-        winner = outcomes[prices.index(max(prices))]
-        return winner.lower()
+            outcomes = json.loads(market["outcomes"])
+            prices = list(map(float, json.loads(market["outcomePrices"])))
 
-    except Exception as e:
-        print(f"Error with {slug}: {e}")
-        return None
+            winner = outcomes[prices.index(max(prices))]
+            return winner.lower()
+
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(0.5)  # retry backoff
+            else:
+                print(f"Error with {slug}: {e}")
+                return None
 
 
 def main():
@@ -37,15 +46,16 @@ def main():
 
     # 2. Obtener slugs únicos
     unique_slugs = df["market_slug"].dropna().unique()
+    total = len(unique_slugs)
 
-    print(f"Unique markets to query: {len(unique_slugs)}")
+    print(f"Unique markets to query: {total}")
 
     # 3. Construir dataset de resoluciones
     resolution_rows = []
 
-    for slug in unique_slugs:
-        print("Fetching:", slug)
-
+    # tqdm añade barra de progreso + ETA
+    for slug in tqdm(unique_slugs, total=total, desc="Fetching markets"):
+        
         resolution = get_market_resolution(slug)
 
         resolution_rows.append({

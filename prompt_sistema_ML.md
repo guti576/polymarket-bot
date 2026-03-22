@@ -1,5 +1,3 @@
-Actúa como un Senior Quant ML Engineer especializado en trading algorítmico, series temporales y backtesting.
-
 Quiero que construyas un notebook de Jupyter en Python, completamente funcional y bien estructurado, para resolver este problema de predicción y simulación sobre mercados binarios de Polymarket BTC up/down de 5 minutos.
 
 OBJETIVO
@@ -23,24 +21,18 @@ Tengo un dataset histórico con snapshots temporales (cada pocos segundos) del m
    - win rate
    - profit factor
    - ROI total
-   - Sharpe simple si procede
    - número de trades
-   - métricas por mercado y globales
 
 REQUISITOS IMPORTANTES DEL MODELO
-- Debe evitar leakage temporal.
+- Debe evitar leakage temporal (look ahead bias).
 - La validación debe hacerse respetando el orden temporal.
 - Si hay varios snapshots por market_slug, no se debe mezclar información futura del mismo mercado en train y test.
 - La partición debe hacerse por mercado y por tiempo, de forma robusta.
 - El notebook debe incluir separación train / validation / test.
-- Si usas calibración de probabilidades, hazla correctamente.
-- Debe comparar al menos un baseline sencillo contra un modelo más potente.
 
 MODELAJE
-Quiero que propongas y pruebes, como mínimo:
-- un baseline interpretable, por ejemplo Logistic Regression o XGBoost/LightGBM con features bien preparadas
-- un modelo más potente, por ejemplo LightGBM, XGBoost o CatBoost
-- si lo consideras útil, una versión con calibración de probabilidades
+Quiero que propongas y pruebes:
+- XGBoost con features bien preparadas
 
 FEATURE ENGINEERING
 Puedes crear features adicionales a partir de las variables existentes, por ejemplo:
@@ -71,11 +63,14 @@ Ejemplo de criterio deseado:
 - entrar en DOWN solo si el EV esperado de DOWN es positivo y mayor que un umbral mínimo
 - si ambos son positivos, elegir la mejor oportunidad por EV o ROI esperado
 - si ninguno cumple el umbral, no operar
+- Solo una operación (trade) por mercado, la que aparezca primero
 
 Quiero que la señal final pueda ser algo como:
 - `LONG_UP`
 - `LONG_DOWN`
 - `NO_TRADE`
+
+Incluye también una estrategia de salida de la posición y compárala vs exit a final del mercado.
 
 BACKTEST
 El backtest debe simular una cartera con stake fijo o variable, configurable por parámetro.
@@ -97,11 +92,9 @@ MÉTRICAS
 Debes reportar como mínimo:
 - Accuracy
 - ROC AUC
-- PR AUC si aplica
 - ROI medio por trade
 - win rate
 - max drawdown
-- profit factor
 - equity final
 
 EXPLICABILIDAD
@@ -139,7 +132,6 @@ RESTRICCIONES Y BUENAS PRÁCTICAS
 - Maneja NaNs e infinitos.
 - Normaliza o escala solo si el modelo lo requiere.
 - No uses variables futuras para construir features.
-- No hagas supuestos no justificados: explícitalos.
 
 VARIABLES DEL DATASET
 ## Market Metadata
@@ -305,4 +297,3 @@ Derived from the last 200 individual trades on Binance. `isBuyerMaker = true` me
 | `buy_volume_last200` | Total BTC volume of aggressively initiated buy trades in the last 200 trades. |
 | `sell_volume_last200` | Total BTC volume of aggressively initiated sell trades in the last 200 trades. |
 | `trade_imbalance` | Net directional flow: `(buy − sell) / (buy + sell)`. Positive means buyers are more aggressive. |
-| `ret_30s` | BTC price return over the last 30 seconds, computed from individual trade timestamps. Captures sub-minute momentum not visible in 1m klines. Represents ~10% of the 5-minute market window. |
