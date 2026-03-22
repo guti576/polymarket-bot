@@ -11,24 +11,28 @@
     "mkt_premium",
     "up_book_imbalance",
     "down_book_imbalance",
+    "btc_poly_divergence",
     "recent_up_pct_5",
     "recent_streak",
+    "recent_mkt_surprise_5",
     "market_progress"
   ],
   "TRAIN_MED": {
-    "ret_1m": 1.415650783265221e-07,
-    "ret_3m": 3.877310410294044e-06,
-    "ret_5m": 1.627017661065544e-05,
-    "ret_10m": 4.020645732683015e-05,
+    "ret_1m": 0.0,
+    "ret_3m": 4.813015072491211e-06,
+    "ret_5m": 1.754114211238722e-05,
+    "ret_10m": 5.455830388689797e-05,
     "btc_return_since_open": 0.0,
-    "volatility_5m": 0.0004204103999095,
-    "vol_ratio": 1.0015495118702429,
-    "volume_1m": 6.18851,
+    "volatility_5m": 0.0004039484491196,
+    "vol_ratio": 1.0037225026161911,
+    "volume_1m": 5.91282,
     "mkt_premium": 0.010000000000000009,
-    "up_book_imbalance": -0.03846153846079882,
-    "down_book_imbalance": 0.039525560745984435,
+    "up_book_imbalance": -0.038755166358193434,
+    "down_book_imbalance": 0.03758140211722779,
+    "btc_poly_divergence": -0.009627353185753609,
     "recent_up_pct_5": 0.6,
     "recent_streak": 1.0,
+    "recent_mkt_surprise_5": 0.0,
     "market_progress": 0.4967
   },
   "CFG": {
@@ -37,10 +41,10 @@
     "STAKE": 10.0,
     "INIT_CAPITAL": 1000.0,
     "ENTRY_LO": 0.1,
-    "ENTRY_HI": 0.7,
+    "ENTRY_HI": 0.4,
     "MIN_P": 0.65,
     "VALUE_EDGE": 0.08,
-    "FLIP_THRESH": 0.15
+    "FLIP_THRESH": 0.2
   },
   "USE_XGB": true
 }
