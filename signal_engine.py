@@ -427,8 +427,14 @@ def run(args):
     log.info("Vigilando %s (poll=%.1fs)", args.input, args.poll)
     log.info("Señales → %s", args.output)
 
+    # ── Timestamp de lanzamiento: ignorar datos anteriores ───────────────
+    launch_time = datetime.now(timezone.utc)
+    log.info("🚀 Launch time: %s — datos anteriores se usan solo para calibración",
+             launch_time.strftime("%Y-%m-%d %H:%M:%S UTC"))
+
     n_processed = 0
     n_signals = 0
+    n_skipped_historical = 0
 
     try:
         while True:
@@ -443,63 +449,63 @@ def run(args):
             df_new = engineer_features(df_new)
 
             # ── Alimentar el calibrador con los datos nuevos ─────────────
+            # (siempre, incluso datos históricos — para mantener umbrales frescos)
             calibrator.feed(df_new, cfg["ENTRY_LO"], cfg["ENTRY_HI"])
 
             # ── Evaluar señales con umbrales actuales ────────────────────
             df_eval = evaluate_signals(df_new, cfg, calibrator)
 
-            # Construir output
+            # Construir output — SOLO trades reales (LONG_UP / LONG_DOWN)
             output_batch = []
             for _, row in df_eval.iterrows():
                 mkt = row["market_slug"]
-                ts_now = datetime.now(timezone.utc)
                 ts_data = pd.Timestamp(row["timestamp"])
                 if ts_data.tzinfo is None:
                     ts_data = ts_data.tz_localize("UTC")
-                delay_ms = (ts_now - ts_data).total_seconds() * 1000
 
+                # ── Ignorar datos anteriores al lanzamiento ──────────
+                # Se usan para calibración (arriba) pero no generan trades
+                if ts_data < launch_time:
+                    n_skipped_historical += 1
+                    continue
+
+                ts_now = datetime.now(timezone.utc)
+                delay_ms = (ts_now - ts_data).total_seconds() * 1000
                 raw_signal = row["signal"]
+
+                # Solo nos interesan trades nuevos
+                if raw_signal not in ("LONG_UP", "LONG_DOWN"):
+                    continue
 
                 # 1 trade por mercado
                 if tracker.is_active(mkt):
-                    signal = f"ACTIVE_TRADE:{tracker.get_signal(mkt)}"
-                else:
-                    signal = raw_signal
-                    if signal in ("LONG_UP", "LONG_DOWN"):
-                        tracker.mark(mkt, signal)
-                        n_signals += 1
+                    continue
 
-                        entry_ask = float(row["up_ask_p_1"] if signal == "LONG_UP"
-                                          else row["down_ask_p_1"])
-                        payout = 1.0 / entry_ask if entry_ask > 0 else 0
+                tracker.mark(mkt, raw_signal)
+                n_signals += 1
 
-                        cal_tag = "auto" if calibrator.is_calibrated else "fixed"
-                        log.info(
-                            "🔔 %s │ %s │ ret=%.6f │ thresh=[%.6f,%.6f] %s │ "
-                            "ask=%.4f │ payout=%.2fx │ prog=%.1f%% │ delay=%dms",
-                            signal, mkt,
-                            float(row.get("btc_return_since_open", 0)),
-                            calibrator.threshold_up, calibrator.threshold_down, cal_tag,
-                            entry_ask, payout,
-                            float(row["market_progress"]) * 100,
-                            delay_ms,
-                        )
+                entry_ask = float(row["up_ask_p_1"] if raw_signal == "LONG_UP"
+                                  else row["down_ask_p_1"])
+                payout = 1.0 / entry_ask if entry_ask > 0 else 0
 
-                # Entry ask para el log
-                if raw_signal == "LONG_UP":
-                    e_ask = float(row.get("up_ask_p_1", np.nan))
-                elif raw_signal == "LONG_DOWN":
-                    e_ask = float(row.get("down_ask_p_1", np.nan))
-                else:
-                    e_ask = np.nan
-                e_payout = 1.0 / e_ask if (not np.isnan(e_ask) and e_ask > 0) else np.nan
+                cal_tag = "auto" if calibrator.is_calibrated else "fixed"
+                log.info(
+                    "🔔 %s │ %s │ ret=%.6f │ thresh=[%.6f,%.6f] %s │ "
+                    "ask=%.4f │ payout=%.2fx │ prog=%.1f%% │ delay=%dms",
+                    raw_signal, mkt,
+                    float(row.get("btc_return_since_open", 0)),
+                    calibrator.threshold_up, calibrator.threshold_down, cal_tag,
+                    entry_ask, payout,
+                    float(row["market_progress"]) * 100,
+                    delay_ms,
+                )
 
                 output_batch.append({
                     "ts_data": ts_data.isoformat(),
                     "ts_processed": ts_now.isoformat(),
                     "delay_ms": round(delay_ms, 1),
                     "market_slug": mkt,
-                    "signal": signal,
+                    "signal": raw_signal,
                     "btc_return": round(float(row.get("btc_return_since_open", np.nan)), 8),
                     "threshold_up": round(calibrator.threshold_up, 8),
                     "threshold_down": round(calibrator.threshold_down, 8),
@@ -509,8 +515,8 @@ def run(args):
                     "down_ask_p_1": round(float(row.get("down_ask_p_1", np.nan)), 5),
                     "up_bid_p_1": round(float(row.get("up_bid_p_1", np.nan)), 5),
                     "down_bid_p_1": round(float(row.get("down_bid_p_1", np.nan)), 5),
-                    "entry_ask": round(e_ask, 5) if not np.isnan(e_ask) else "",
-                    "potential_payout": round(e_payout, 4) if not np.isnan(e_payout) else "",
+                    "entry_ask": round(entry_ask, 5),
+                    "potential_payout": round(payout, 4),
                 })
 
             writer.append(output_batch)
@@ -523,9 +529,9 @@ def run(args):
                           else f"warming up ({calibrator.sample_count}/{calibrator.min_samples})")
 
             log.info(
-                "📊 rows=%d (+%d) │ signals=%d │ active=%d │ "
+                "📊 rows=%d (+%d) │ signals=%d │ active=%d │ skipped_hist=%d │ "
                 "thresh=[%.6f, %.6f] %s │ %.0fms",
-                n_processed, len(df_new), n_signals, tracker.count,
+                n_processed, len(df_new), n_signals, tracker.count, n_skipped_historical,
                 calibrator.threshold_up, calibrator.threshold_down, cal_status,
                 elapsed_ms,
             )
