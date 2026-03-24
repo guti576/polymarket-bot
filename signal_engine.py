@@ -1,38 +1,42 @@
 #!/usr/bin/env python3
 """
-signal_engine.py — Motor de señales Polymarket BTC v6
+signal_engine.py — Motor de señales Polymarket BTC · Strong Momentum
+
+Estrategia 11_Strong_Momentum con umbrales AUTO-CALIBRADOS:
+    Mantiene una ventana rolling de btc_return_since_open y recalcula
+    los percentiles 75/25 automáticamente. Así los umbrales se adaptan
+    si BTC cambia de régimen (más o menos volatilidad).
+
+    Si btc_return_since_open > P75_rolling  → LONG_UP
+    Si btc_return_since_open < P25_rolling  → LONG_DOWN
+    En otro caso                            → NO_TRADE
+
+Sin ML. Solo una regla dura basada en momentum fuerte de BTC.
 
 Lee incrementalmente polymarket_dataset_5m.csv, genera señales
 LONG_UP / LONG_DOWN / NO_TRADE y las escribe en trades_5m.csv.
 
 Uso:
-    python signal_engine.py                        # defaults
-    python signal_engine.py --model-dir ./model    # ruta a artefactos
-    python signal_engine.py --poll 2.0             # polling cada 2s
+    python signal_engine.py
+    python signal_engine.py --window 500 --percentile 75
+    python signal_engine.py --no-autocalibrate --ret-up 0.0005
+    python signal_engine.py --poll 2.0 --input live_data.csv
 
 Requisitos:
-    pip install xgboost pandas numpy
-
-Artefactos (generados por el notebook, sección 5b):
-    model/booster.json   — XGBoost serializado
-    model/isotonic.pkl   — calibración isotónica
-    model/config.json    — FEATURES, TRAIN_MED, CFG
+    pip install pandas numpy
 """
 
 import argparse
 import json
 import logging
 import os
-import pickle
-import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 from io import StringIO
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import xgboost as xgb
 
 # =============================================================================
 # Logging
@@ -46,135 +50,191 @@ log = logging.getLogger("signal_engine")
 
 
 # =============================================================================
-# Modelo y configuración
+# Configuración
 # =============================================================================
-class Model:
-    """Carga los artefactos del notebook y expone predict(df) → p_up."""
+DEFAULT_CFG = dict(
+    # ── Ventana de operación ─────────────────────────────────────────────
+    ENTRY_LO=0.10,
+    ENTRY_HI=0.60,
 
-    def __init__(self, model_dir: str):
-        model_dir = Path(model_dir)
+    # ── Umbrales iniciales (se usan antes de tener datos suficientes) ────
+    RET_THRESHOLD_UP=0.00035,
+    RET_THRESHOLD_DOWN=-0.00035,
 
-        # Config
-        with open(model_dir / "config.json") as f:
-            cfg = json.load(f)
-        self.features: list[str] = cfg["FEATURES"]
-        self.train_med: dict[str, float] = cfg["TRAIN_MED"]
-        self.strategy: dict = cfg["CFG"]
-        log.info("Config cargada: %d features, strategy=%s", len(self.features), self.strategy)
+    # ── Auto-calibración ─────────────────────────────────────────────────
+    AUTOCALIBRATE=True,
+    CALIBRATION_WINDOW=500,    # nº de snapshots en la ventana rolling
+    CALIBRATION_MIN=50,        # mínimo de muestras para empezar a calibrar
+    CALIBRATION_PERCENTILE=75, # percentil para el umbral (75 → P75 y P25)
 
-        # XGBoost
-        self.booster = xgb.Booster()
-        self.booster.load_model(str(model_dir / "booster.json"))
-        log.info("XGBoost booster cargado")
+    # ── Apuesta ──────────────────────────────────────────────────────────
+    STAKE=10.0,
+)
 
-        # Isotonic calibration
-        with open(model_dir / "isotonic.pkl", "rb") as f:
-            self.iso_cal = pickle.load(f)
-        log.info("Calibración isotónica cargada")
 
-    def predict(self, df: pd.DataFrame) -> np.ndarray:
-        """Retorna p_up calibrada para cada fila."""
-        X = self._to_matrix(df)
-        dm = xgb.DMatrix(X, feature_names=self.features)
-        p_raw = self.booster.predict(dm)
-        p_cal = self.iso_cal.transform(p_raw)
-        return p_cal
+def load_config(config_path: str | None) -> dict:
+    """Carga config desde JSON si existe, sino usa defaults."""
+    cfg = DEFAULT_CFG.copy()
+    if config_path and os.path.exists(config_path):
+        with open(config_path) as f:
+            user_cfg = json.load(f)
+        cfg.update(user_cfg)
+        log.info("Config cargada desde %s", config_path)
+    return cfg
 
-    def _to_matrix(self, df: pd.DataFrame) -> np.ndarray:
-        """Extrae features y aplica imputación con medianas de train."""
-        med = pd.Series(self.train_med)
-        X = (
-            df[self.features]
-            .replace([np.inf, -np.inf], np.nan)
-            .fillna(med)
-            .values
+
+# =============================================================================
+# Auto-calibrador de umbrales
+# =============================================================================
+class ThresholdCalibrator:
+    """
+    Mantiene una ventana rolling de btc_return_since_open y recalcula
+    los percentiles P75/P25 automáticamente.
+
+    Solo alimenta la ventana con snapshots dentro de la zona de operación
+    [ENTRY_LO, ENTRY_HI], para ser consistente con cómo se calibraron
+    los umbrales en el backtest.
+
+    Comportamiento:
+    - Hasta tener CALIBRATION_MIN muestras → usa umbrales iniciales
+    - Después → recalcula P75/P25 con los últimos CALIBRATION_WINDOW valores
+    - Loguea cada vez que los umbrales cambian significativamente (>10%)
+    """
+
+    def __init__(self, cfg: dict):
+        self.window_size = cfg["CALIBRATION_WINDOW"]
+        self.min_samples = cfg["CALIBRATION_MIN"]
+        self.percentile = cfg["CALIBRATION_PERCENTILE"]
+        self.enabled = cfg["AUTOCALIBRATE"]
+
+        # Ventana rolling (deque con maxlen = auto-descarta los viejos)
+        self._buffer: deque[float] = deque(maxlen=self.window_size)
+
+        # Umbrales actuales (empiezan con los defaults / config)
+        self.threshold_up: float = cfg["RET_THRESHOLD_UP"]
+        self.threshold_down: float = cfg["RET_THRESHOLD_DOWN"]
+
+        # Para detectar cambios y loguear
+        self._last_logged_up: float = self.threshold_up
+        self._last_logged_down: float = self.threshold_down
+
+        if self.enabled:
+            log.info("Auto-calibración ACTIVADA: window=%d, min=%d, percentil=%d",
+                     self.window_size, self.min_samples, self.percentile)
+        else:
+            log.info("Auto-calibración DESACTIVADA: umbrales fijos UP=%.6f DOWN=%.6f",
+                     self.threshold_up, self.threshold_down)
+
+    def feed(self, df: pd.DataFrame, entry_lo: float, entry_hi: float):
+        """
+        Alimenta la ventana con valores de btc_return_since_open de
+        snapshots dentro de la zona de operación.
+        """
+        if not self.enabled:
+            return
+
+        mask = (
+            (df["market_progress"] >= entry_lo) &
+            (df["market_progress"] <= entry_hi) &
+            (df["btc_return_since_open"].notna())
         )
-        return X
+        new_values = df.loc[mask, "btc_return_since_open"].values
+
+        for v in new_values:
+            self._buffer.append(float(v))
+
+        # Recalcular si tenemos suficientes muestras
+        if len(self._buffer) >= self.min_samples:
+            arr = np.array(self._buffer)
+            new_up = float(np.percentile(arr, self.percentile))
+            new_down = float(np.percentile(arr, 100 - self.percentile))
+
+            # Loguear si cambio significativo (>10% relativo)
+            if self._last_logged_up != 0:
+                change_up = abs(new_up - self._last_logged_up) / (abs(self._last_logged_up) + 1e-12)
+                change_down = abs(new_down - self._last_logged_down) / (abs(self._last_logged_down) + 1e-12)
+                if change_up > 0.10 or change_down > 0.10:
+                    log.info(
+                        "📐 Umbrales recalibrados: UP=%.6f→%.6f (%.1f%%)  "
+                        "DOWN=%.6f→%.6f (%.1f%%)  [%d muestras]",
+                        self._last_logged_up, new_up, change_up * 100,
+                        self._last_logged_down, new_down, change_down * 100,
+                        len(self._buffer),
+                    )
+                    self._last_logged_up = new_up
+                    self._last_logged_down = new_down
+
+            self.threshold_up = new_up
+            self.threshold_down = new_down
+
+    @property
+    def is_calibrated(self) -> bool:
+        return len(self._buffer) >= self.min_samples
+
+    @property
+    def sample_count(self) -> int:
+        return len(self._buffer)
 
 
 # =============================================================================
-# Feature engineering (producción)
+# Columnas necesarias del CSV
 # =============================================================================
-# Columnas mínimas del CSV que necesitamos leer
 COLS_NEEDED = [
     "timestamp", "market_slug", "market_progress",
-    # BTC
-    "ret_1m", "ret_3m", "ret_5m", "ret_10m",
     "btc_return_since_open",
-    "volatility_3m", "volatility_5m", "volume_1m",
-    # Polymarket L1
     "up_ask_p_1", "down_ask_p_1",
     "up_bid_p_1", "down_bid_p_1",
-    "up_bid_s_1", "up_ask_s_1",
-    "down_bid_s_1", "down_ask_s_1",
-    # Payoffs (para EV en el log)
+    "up_ask_s_1", "down_ask_s_1",
     "up_win_net", "down_win_net",
     "up_loss_net", "down_loss_net",
 ]
 
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Calcula las 4 features derivadas, in-place."""
-    df["vol_ratio"] = df["volatility_3m"] / (df["volatility_5m"] + 1e-9)
-    df["mkt_premium"] = df["up_ask_p_1"] - df["down_ask_p_1"]
-    df["up_book_imbalance"] = (
-        (df["up_bid_s_1"] - df["up_ask_s_1"])
-        / (df["up_bid_s_1"] + df["up_ask_s_1"] + 1e-9)
-    )
-    df["down_book_imbalance"] = (
-        (df["down_bid_s_1"] - df["down_ask_s_1"])
-        / (df["down_bid_s_1"] + df["down_ask_s_1"] + 1e-9)
-    )
+    """Limpieza mínima."""
     df["market_progress"] = df["market_progress"].clip(0.0, 1.0)
     return df
 
 
 # =============================================================================
-# Estrategia de señales
+# Estrategia: Strong Momentum
 # =============================================================================
-def evaluate_signals(df: pd.DataFrame, p_up: np.ndarray, cfg: dict) -> pd.DataFrame:
+def evaluate_signals(df: pd.DataFrame, cfg: dict, calibrator: ThresholdCalibrator) -> pd.DataFrame:
     """
-    Evalúa cada fila y retorna un DataFrame con las señales.
-    Una fila por snapshot evaluado, con signal = LONG_UP / LONG_DOWN / NO_TRADE.
+    Evalúa cada fila con la regla 11_Strong_Momentum.
+    Los umbrales vienen del calibrator (auto-calibrados o fijos).
     """
     df = df.copy()
-    df["p_up"] = p_up
-    df["p_down"] = 1.0 - p_up
-
-    # Value edge
-    df["value_edge_up"] = df["p_up"] - df["up_ask_p_1"]
-    df["value_edge_down"] = df["p_down"] - df["down_ask_p_1"]
-
-    # EV
-    df["ev_up"] = df["p_up"] * df["up_win_net"] + df["p_down"] * df["up_loss_net"]
-    df["ev_down"] = df["p_down"] * df["down_win_net"] + df["p_up"] * df["down_loss_net"]
 
     lo = cfg["ENTRY_LO"]
     hi = cfg["ENTRY_HI"]
-    min_p = cfg["MIN_P"]
-    min_ve = cfg["VALUE_EDGE"]
+    ret_up = calibrator.threshold_up
+    ret_down = calibrator.threshold_down
 
     signals = []
     for _, row in df.iterrows():
-        # Filtro de ventana temporal
         prog = row["market_progress"]
         if prog < lo or prog > hi:
             signals.append("NO_TRADE")
             continue
 
-        # Evaluar UP y DOWN
-        candidates = []
-        for direction, p_col, ask_col, ve_col, ev_col in [
-            ("LONG_UP", "p_up", "up_ask_p_1", "value_edge_up", "ev_up"),
-            ("LONG_DOWN", "p_down", "down_ask_p_1", "value_edge_down", "ev_down"),
-        ]:
-            p = float(row[p_col])
-            ve = float(row[ve_col])
-            if p >= min_p and ve >= min_ve:
-                candidates.append((direction, ve))
+        ret = row.get("btc_return_since_open", np.nan)
+        if pd.isna(ret):
+            signals.append("NO_TRADE")
+            continue
 
-        if candidates:
-            signals.append(max(candidates, key=lambda x: x[1])[0])
+        if ret > ret_up:
+            ask = row.get("up_ask_p_1", np.nan)
+            if pd.isna(ask) or ask <= 0 or ask >= 1.0:
+                signals.append("NO_TRADE")
+            else:
+                signals.append("LONG_UP")
+        elif ret < ret_down:
+            ask = row.get("down_ask_p_1", np.nan)
+            if pd.isna(ask) or ask <= 0 or ask >= 1.0:
+                signals.append("NO_TRADE")
+            else:
+                signals.append("LONG_DOWN")
         else:
             signals.append("NO_TRADE")
 
@@ -186,10 +246,7 @@ def evaluate_signals(df: pd.DataFrame, p_up: np.ndarray, cfg: dict) -> pd.DataFr
 # Lector incremental de CSV
 # =============================================================================
 class IncrementalCSVReader:
-    """
-    Lee un CSV que crece por append. Solo parsea las filas nuevas
-    en cada llamada a read_new(), usando byte offset.
-    """
+    """Lee un CSV que crece por append. Solo parsea filas nuevas."""
 
     def __init__(self, path: str, usecols: list[str] | None = None):
         self.path = path
@@ -199,27 +256,19 @@ class IncrementalCSVReader:
         self._header_cols: list[str] | None = None
 
     def read_new(self) -> pd.DataFrame | None:
-        """Retorna DataFrame con filas nuevas, o None si no hay cambios.
-
-        Seguro ante escrituras concurrentes: si la última línea está
-        truncada (el writer está a mitad de flush), se descarta y el
-        offset se retrocede para releerla completa en el siguiente tick.
-        """
         try:
             file_size = os.path.getsize(self.path)
         except FileNotFoundError:
             return None
 
         if file_size <= self._byte_offset:
-            return None  # sin datos nuevos
+            return None
 
         with open(self.path, "r", encoding="utf-8") as f:
-            # Primera lectura: capturar header
             if self._header is None:
                 self._header = f.readline()
                 self._header_cols = [c.strip() for c in self._header.strip().split(",")]
                 self._byte_offset = f.tell()
-
                 remaining = f.read()
                 if not remaining.strip():
                     return None
@@ -227,59 +276,44 @@ class IncrementalCSVReader:
             else:
                 f.seek(self._byte_offset)
                 raw = f.read()
-
                 if not raw.strip():
                     return None
 
-            # Descartar última línea si no termina en \n (escritura parcial)
             if not raw.endswith("\n"):
                 last_nl = raw.rfind("\n")
                 if last_nl == -1:
-                    # Solo hay una línea parcial — no consumir nada
                     return None
-                truncated = raw[last_nl + 1:]
                 raw = raw[: last_nl + 1]
-                # Retroceder offset para releer la línea parcial
                 self._byte_offset += len(raw.encode("utf-8"))
             else:
                 self._byte_offset += len(raw.encode("utf-8"))
 
             chunk = self._header + raw
 
-        df = pd.read_csv(
-            StringIO(chunk),
-            parse_dates=["timestamp"],
-            usecols=self.usecols,
-        )
+        available = self._header_cols
+        if self.usecols:
+            usecols = [c for c in self.usecols if c in available]
+        else:
+            usecols = None
+
+        df = pd.read_csv(StringIO(chunk), parse_dates=["timestamp"], usecols=usecols)
         return df
 
 
 # =============================================================================
-# Writer de señales (1 fila output por cada fila input)
+# Writer de señales
 # =============================================================================
 OUTPUT_COLUMNS = [
-    "ts_data",           # timestamp del snapshot (del CSV)
-    "ts_processed",      # timestamp de procesamiento (para medir delay)
-    "delay_ms",          # delay en milisegundos
-    "market_slug",
-    "signal",            # LONG_UP / LONG_DOWN / NO_TRADE / ACTIVE_TRADE
-    "p_up",
-    "p_down",
-    "value_edge_up",
-    "value_edge_down",
-    "ev_up",
-    "ev_down",
+    "ts_data", "ts_processed", "delay_ms",
+    "market_slug", "signal",
+    "btc_return", "threshold_up", "threshold_down", "calibrated",
     "market_progress",
-    "up_ask_p_1",
-    "down_ask_p_1",
-    "up_bid_p_1",
-    "down_bid_p_1",
+    "up_ask_p_1", "down_ask_p_1", "up_bid_p_1", "down_bid_p_1",
+    "entry_ask", "potential_payout",
 ]
 
 
 class SignalWriter:
-    """Escribe una fila por cada fila de entrada en trades_5m.csv."""
-
     def __init__(self, path: str):
         self.path = path
         if not os.path.exists(path):
@@ -294,22 +328,17 @@ class SignalWriter:
 
 
 # =============================================================================
-# Tracker de mercados con trade activo
+# Tracker de mercados
 # =============================================================================
 class MarketTracker:
-    """
-    Lleva registro de mercados que ya tienen señal LONG_UP/LONG_DOWN emitida.
-    Un solo trade por mercado — consistente con el backtest.
-    """
+    """1 trade por mercado."""
 
     def __init__(self, trades_path: str):
-        self._active: dict[str, str] = {}  # market_slug → signal (LONG_UP/LONG_DOWN)
-        # Cargar trades activos de runs anteriores
+        self._active: dict[str, str] = {}
         if os.path.exists(trades_path):
             try:
                 existing = pd.read_csv(trades_path, usecols=["market_slug", "signal"])
                 trades = existing[existing["signal"].isin(["LONG_UP", "LONG_DOWN"])]
-                # Quedarse con la primera señal por mercado
                 first = trades.drop_duplicates(subset="market_slug", keep="first")
                 self._active = dict(zip(first["market_slug"], first["signal"]))
                 log.info("Recuperados %d mercados con trade activo", len(self._active))
@@ -335,37 +364,68 @@ class MarketTracker:
 # =============================================================================
 def run(args):
     log.info("=" * 60)
-    log.info("  Signal Engine v6 — Polymarket BTC")
+    log.info("  Signal Engine — 11_Strong_Momentum (auto-calibrated)")
     log.info("=" * 60)
 
-    # Cargar modelo
-    model = Model(args.model_dir)
-    cfg = model.strategy
+    cfg = load_config(args.config)
 
-    # Override de estrategia desde CLI
+    # CLI overrides
     overrides = {
         "ENTRY_LO": args.entry_lo,
         "ENTRY_HI": args.entry_hi,
-        "MIN_P": args.min_p,
-        "VALUE_EDGE": args.value_edge,
-        "FLIP_THRESH": args.flip,
+        "RET_THRESHOLD_UP": args.ret_up,
+        "RET_THRESHOLD_DOWN": args.ret_down,
+        "CALIBRATION_WINDOW": args.window,
+        "CALIBRATION_PERCENTILE": args.percentile,
     }
     for key, val in overrides.items():
         if val is not None:
-            old = cfg[key]
+            old = cfg.get(key, "N/A")
             cfg[key] = val
-            log.info("  Override: %s = %.4f (config.json: %.4f)", key, val, old)
+            log.info("  Override: %s = %s (was: %s)", key, val, old)
 
-    # Solo leer columnas necesarias (velocidad)
-    # Filtrar a las que existen en COLS_NEEDED
+    if args.no_autocalibrate:
+        cfg["AUTOCALIBRATE"] = False
+
+    # Calibrador de umbrales
+    calibrator = ThresholdCalibrator(cfg)
+
+    log.info("Estrategia: ENTRY=[%.2f, %.2f]", cfg["ENTRY_LO"], cfg["ENTRY_HI"])
+
+    # ── Pre-cargar calibrador con datos históricos del CSV ───────────────
+    # Si el CSV ya existe y tiene datos, leemos las últimas N filas para
+    # que el calibrador arranque ya calibrado (sin warmup).
+    if calibrator.enabled and os.path.exists(args.input):
+        try:
+            # Leer solo las columnas que necesitamos para calibrar
+            hist_cols = ["market_progress", "btc_return_since_open"]
+            # Leemos todo y nos quedamos con la cola — para CSVs grandes
+            # se podría optimizar, pero con ~100K filas es instantáneo
+            df_hist = pd.read_csv(args.input, usecols=hist_cols)
+            # Quedarnos con las últimas CALIBRATION_WINDOW×2 filas
+            # (×2 porque solo una fracción estará en la ventana de operación)
+            tail_size = cfg["CALIBRATION_WINDOW"] * 3
+            if len(df_hist) > tail_size:
+                df_hist = df_hist.tail(tail_size)
+            calibrator.feed(df_hist, cfg["ENTRY_LO"], cfg["ENTRY_HI"])
+            log.info("📂 Pre-cargados %d datos históricos de %s → calibrador %s (%d muestras, UP=%.6f DOWN=%.6f)",
+                     len(df_hist), args.input,
+                     "CALIBRADO" if calibrator.is_calibrated else "en warmup",
+                     calibrator.sample_count,
+                     calibrator.threshold_up, calibrator.threshold_down)
+        except Exception as e:
+            log.warning("No se pudo pre-cargar histórico: %s (arrancando con umbrales iniciales)", e)
+    else:
+        log.info("Umbrales iniciales: UP=%.6f  DOWN=%.6f",
+                 calibrator.threshold_up, calibrator.threshold_down)
+
+    # I/O
     reader = IncrementalCSVReader(args.input, usecols=COLS_NEEDED)
     writer = SignalWriter(args.output)
     tracker = MarketTracker(args.output)
 
     log.info("Vigilando %s (poll=%.1fs)", args.input, args.poll)
     log.info("Señales → %s", args.output)
-    log.info("Estrategia: MIN_P=%.2f  VALUE_EDGE=%.2f  ENTRY=[%.2f, %.2f]  FLIP=%.2f",
-             cfg["MIN_P"], cfg["VALUE_EDGE"], cfg["ENTRY_LO"], cfg["ENTRY_HI"], cfg["FLIP_THRESH"])
 
     n_processed = 0
     n_signals = 0
@@ -380,16 +440,15 @@ def run(args):
 
             t_start = time.perf_counter()
 
-            # Feature engineering
             df_new = engineer_features(df_new)
 
-            # Inferencia sobre TODAS las filas
-            p_up = model.predict(df_new)
+            # ── Alimentar el calibrador con los datos nuevos ─────────────
+            calibrator.feed(df_new, cfg["ENTRY_LO"], cfg["ENTRY_HI"])
 
-            # Evaluar señales (sin filtro de tracker — evalúa todo)
-            df_eval = evaluate_signals(df_new, p_up, cfg)
+            # ── Evaluar señales con umbrales actuales ────────────────────
+            df_eval = evaluate_signals(df_new, cfg, calibrator)
 
-            # Construir 1 fila de output por cada fila de input
+            # Construir output
             output_batch = []
             for _, row in df_eval.iterrows():
                 mkt = row["market_slug"]
@@ -399,26 +458,41 @@ def run(args):
                     ts_data = ts_data.tz_localize("UTC")
                 delay_ms = (ts_now - ts_data).total_seconds() * 1000
 
-                raw_signal = row["signal"]  # LONG_UP / LONG_DOWN / NO_TRADE
+                raw_signal = row["signal"]
 
-                # Si ya hay trade activo para este mercado → ACTIVE_TRADE
+                # 1 trade por mercado
                 if tracker.is_active(mkt):
                     signal = f"ACTIVE_TRADE:{tracker.get_signal(mkt)}"
                 else:
                     signal = raw_signal
-                    # Registrar nuevo trade
                     if signal in ("LONG_UP", "LONG_DOWN"):
                         tracker.mark(mkt, signal)
                         n_signals += 1
+
+                        entry_ask = float(row["up_ask_p_1"] if signal == "LONG_UP"
+                                          else row["down_ask_p_1"])
+                        payout = 1.0 / entry_ask if entry_ask > 0 else 0
+
+                        cal_tag = "auto" if calibrator.is_calibrated else "fixed"
                         log.info(
-                            "🔔 %s │ %s │ p_up=%.3f │ ve_up=%.4f ve_dn=%.4f │ ask=%.3f │ delay=%dms",
+                            "🔔 %s │ %s │ ret=%.6f │ thresh=[%.6f,%.6f] %s │ "
+                            "ask=%.4f │ payout=%.2fx │ prog=%.1f%% │ delay=%dms",
                             signal, mkt,
-                            float(row["p_up"]),
-                            float(row["value_edge_up"]),
-                            float(row["value_edge_down"]),
-                            float(row["up_ask_p_1"] if signal == "LONG_UP" else row["down_ask_p_1"]),
+                            float(row.get("btc_return_since_open", 0)),
+                            calibrator.threshold_up, calibrator.threshold_down, cal_tag,
+                            entry_ask, payout,
+                            float(row["market_progress"]) * 100,
                             delay_ms,
                         )
+
+                # Entry ask para el log
+                if raw_signal == "LONG_UP":
+                    e_ask = float(row.get("up_ask_p_1", np.nan))
+                elif raw_signal == "LONG_DOWN":
+                    e_ask = float(row.get("down_ask_p_1", np.nan))
+                else:
+                    e_ask = np.nan
+                e_payout = 1.0 / e_ask if (not np.isnan(e_ask) and e_ask > 0) else np.nan
 
                 output_batch.append({
                     "ts_data": ts_data.isoformat(),
@@ -426,34 +500,45 @@ def run(args):
                     "delay_ms": round(delay_ms, 1),
                     "market_slug": mkt,
                     "signal": signal,
-                    "p_up": round(float(row["p_up"]), 5),
-                    "p_down": round(float(row["p_down"]), 5),
-                    "value_edge_up": round(float(row["value_edge_up"]), 5),
-                    "value_edge_down": round(float(row["value_edge_down"]), 5),
-                    "ev_up": round(float(row["ev_up"]), 5),
-                    "ev_down": round(float(row["ev_down"]), 5),
+                    "btc_return": round(float(row.get("btc_return_since_open", np.nan)), 8),
+                    "threshold_up": round(calibrator.threshold_up, 8),
+                    "threshold_down": round(calibrator.threshold_down, 8),
+                    "calibrated": calibrator.is_calibrated,
                     "market_progress": round(float(row["market_progress"]), 4),
-                    "up_ask_p_1": round(float(row["up_ask_p_1"]), 5),
-                    "down_ask_p_1": round(float(row["down_ask_p_1"]), 5),
-                    "up_bid_p_1": round(float(row["up_bid_p_1"]), 5),
-                    "down_bid_p_1": round(float(row["down_bid_p_1"]), 5),
+                    "up_ask_p_1": round(float(row.get("up_ask_p_1", np.nan)), 5),
+                    "down_ask_p_1": round(float(row.get("down_ask_p_1", np.nan)), 5),
+                    "up_bid_p_1": round(float(row.get("up_bid_p_1", np.nan)), 5),
+                    "down_bid_p_1": round(float(row.get("down_bid_p_1", np.nan)), 5),
+                    "entry_ask": round(e_ask, 5) if not np.isnan(e_ask) else "",
+                    "potential_payout": round(e_payout, 4) if not np.isnan(e_payout) else "",
                 })
 
-            # Escribir todas las filas
             writer.append(output_batch)
 
             elapsed_ms = (time.perf_counter() - t_start) * 1000
             n_processed += len(df_new)
 
+            cal_status = (f"calibrated ({calibrator.sample_count} samples)"
+                          if calibrator.is_calibrated
+                          else f"warming up ({calibrator.sample_count}/{calibrator.min_samples})")
+
             log.info(
-                "📊 rows=%d (+%d) │ signals=%d │ active=%d │ %.0fms",
-                n_processed, len(df_new), n_signals, tracker.count, elapsed_ms,
+                "📊 rows=%d (+%d) │ signals=%d │ active=%d │ "
+                "thresh=[%.6f, %.6f] %s │ %.0fms",
+                n_processed, len(df_new), n_signals, tracker.count,
+                calibrator.threshold_up, calibrator.threshold_down, cal_status,
+                elapsed_ms,
             )
 
             time.sleep(args.poll)
 
     except KeyboardInterrupt:
-        log.info("Detenido. Total: %d filas procesadas, %d señales emitidas.", n_processed, n_signals)
+        log.info("Detenido. Total: %d filas procesadas, %d señales emitidas.",
+                 n_processed, n_signals)
+        log.info("Umbrales finales: UP=%.6f  DOWN=%.6f  (%s, %d muestras)",
+                 calibrator.threshold_up, calibrator.threshold_down,
+                 "calibrado" if calibrator.is_calibrated else "inicial",
+                 calibrator.sample_count)
 
 
 # =============================================================================
@@ -461,42 +546,62 @@ def run(args):
 # =============================================================================
 def main():
     p = argparse.ArgumentParser(
-        description="Signal Engine — Polymarket BTC v6",
+        description="Signal Engine — 11_Strong_Momentum (auto-calibrated)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Ejemplos:
-  python signal_engine.py
-  python signal_engine.py --value-edge 0.08 --min-p 0.70
-  python signal_engine.py --entry-lo 0.15 --entry-hi 0.60 --flip 0.20
-  python signal_engine.py --poll 0.5 --input live_data.csv
+Estrategia 11_Strong_Momentum con auto-calibración:
 
-Los parámetros de estrategia usan por defecto los valores del config.json
-exportado del notebook. Los flags CLI los sobreescriben sin tocar el archivo.
+  Mantiene una ventana rolling de btc_return_since_open y recalcula
+  los percentiles P75/P25 automáticamente. Los umbrales se adaptan
+  si BTC cambia de régimen.
+
+  Fase 1 (warmup):  usa umbrales iniciales hasta tener >=50 muestras
+  Fase 2 (calibrado): P75/P25 rolling sobre últimos 500 snapshots
+
+Restricciones:
+  - Solo opera en market_progress ∈ [ENTRY_LO, ENTRY_HI]
+  - 1 trade por mercado (máximo)
+  - Hold hasta resolución (sin exit anticipado)
+
+Ejemplos:
+  python signal_engine.py                          # auto-calibración ON
+  python signal_engine.py --window 1000            # ventana más larga
+  python signal_engine.py --percentile 80          # umbrales más estrictos
+  python signal_engine.py --no-autocalibrate       # umbrales fijos
+  python signal_engine.py --no-autocalibrate --ret-up 0.0005
         """,
     )
     # I/O
-    p.add_argument("--model-dir", default="model", help="Directorio con artefactos del modelo")
-    p.add_argument("--input", default="polymarket_dataset_5m.csv", help="CSV de entrada (append-only)")
-    p.add_argument("--output", default="trades_5m.csv", help="CSV de salida con señales")
-    p.add_argument("--poll", type=float, default=1.0, help="Intervalo de polling en segundos")
+    p.add_argument("--input", default="polymarket_dataset_5m.csv",
+                   help="CSV de entrada (append-only)")
+    p.add_argument("--output", default="trades_5m.csv",
+                   help="CSV de salida con señales")
+    p.add_argument("--config", default=None,
+                   help="JSON con configuración (override de defaults)")
+    p.add_argument("--poll", type=float, default=1.0,
+                   help="Intervalo de polling en segundos")
 
-    # Estrategia (override sobre config.json)
-    s = p.add_argument_group("estrategia", "Parámetros de la estrategia (override sobre config.json)")
-    s.add_argument("--entry-lo", type=float, default=None, help="market_progress mínimo para entrar (default: config.json)")
-    s.add_argument("--entry-hi", type=float, default=None, help="market_progress máximo para entrar (default: config.json)")
-    s.add_argument("--min-p", type=float, default=None, help="Probabilidad mínima del modelo para entrar (default: config.json)")
-    s.add_argument("--value-edge", type=float, default=None, help="p_modelo - ask mínimo para entrar (default: config.json)")
-    s.add_argument("--flip", type=float, default=None, help="Umbral de model-flip para exit (default: config.json)")
+    # Estrategia
+    s = p.add_argument_group("estrategia")
+    s.add_argument("--entry-lo", type=float, default=None,
+                   help="market_progress mínimo (default: 0.10)")
+    s.add_argument("--entry-hi", type=float, default=None,
+                   help="market_progress máximo (default: 0.60)")
+    s.add_argument("--ret-up", type=float, default=None,
+                   help="Umbral inicial UP (default: 0.00035)")
+    s.add_argument("--ret-down", type=float, default=None,
+                   help="Umbral inicial DOWN (default: -0.00035)")
+
+    # Auto-calibración
+    c = p.add_argument_group("auto-calibración")
+    c.add_argument("--no-autocalibrate", action="store_true",
+                   help="Desactivar auto-calibración (umbrales fijos)")
+    c.add_argument("--window", type=int, default=None,
+                   help="Tamaño ventana rolling (default: 500)")
+    c.add_argument("--percentile", type=int, default=None,
+                   help="Percentil para umbrales (default: 75)")
+
     args = p.parse_args()
-
-    # Validar artefactos
-    model_dir = Path(args.model_dir)
-    for artifact in ["booster.json", "isotonic.pkl", "config.json"]:
-        if not (model_dir / artifact).exists():
-            log.error("Artefacto no encontrado: %s/%s", model_dir, artifact)
-            log.error("Ejecuta la sección 5b del notebook para exportar el modelo.")
-            sys.exit(1)
-
     run(args)
 
 
