@@ -11,6 +11,27 @@ Traer fichero: scp root@116.203.230.26:~/polymarket-bot/polymarket_pro_dataset.c
 
 Run signal: python signal_engine.py --model-dir ./model --poll 1.0
 
+# Estrategia en Producción: Strong Momentum + Mom Reversal Exit
+
+**Fichero:** `signal_engine.py`
+**Entrada:** `polymarket_dataset_5m.csv` (snapshots en tiempo real)
+**Salida:** `trades_5m.csv` (señales accionables)
+
+## Entrada (Strong Momentum)
+
+Monitoriza mercados BTC UP/DOWN de 5 minutos en Polymarket. Cuando `btc_return_since_open` supera el percentil 75 histórico → `LONG_UP`. Cuando cae por debajo del percentil 25 → `LONG_DOWN`. Los umbrales se auto-calibran con una ventana rolling de 500 snapshots. Solo opera entre el 10% y 60% de vida del mercado. Un trade por mercado.
+
+## Salida (Momentum Reversal)
+
+Si el retorno de BTC cruza cero en contra con un margen de 0.0001 y el mercado ha superado el 15% de progreso → emite `EXIT_UP` o `EXIT_DOWN` para vender shares al bid y cortar pérdidas.
+
+## Restricciones
+
+- No genera trades con datos anteriores al lanzamiento del script (el histórico solo alimenta el calibrador)
+- Stake: 10 USDC por trade, capital: 100€
+- El CSV solo contiene filas accionables (`LONG_*` / `EXIT_*`)
+- Dependencias: `pandas`, `numpy`
+
 # Dataset Variables
 
 ## Market Metadata
