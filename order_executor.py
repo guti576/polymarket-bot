@@ -54,7 +54,7 @@ CFG = dict(
     CHAIN_ID       = 137,                          # Polygon mainnet
 
     # ── Trading ──────────────────────────────────────────────────────────
-    STAKE          = 10.0,      # USDC por trade
+    STAKE          = 2.0,      # USDC por trade
     SLIPPAGE       = 0.03,      # 3% slippage máximo para market orders
 
     # ── Paths ────────────────────────────────────────────────────────────
