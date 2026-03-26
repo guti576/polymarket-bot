@@ -68,12 +68,13 @@ CFG = dict(
 # =============================================================================
 class MarketResolver:
     """
-    Resuelve market_slug → {up_token_id, down_token_id} vía API de Polymarket.
+    Resuelve market_slug → {up_token_id, down_token_id} vía gamma-api.polymarket.com.
     Cachea resultados para no repetir llamadas.
     """
 
-    def __init__(self, host: str):
-        self.host = host
+    GAMMA_API = "https://gamma-api.polymarket.com"
+
+    def __init__(self):
         self._cache: dict[str, dict] = {}
         self._cache_file = "market_cache.json"
         self._load_cache()
@@ -98,19 +99,17 @@ class MarketResolver:
         """
         Retorna {'up_token_id': str, 'down_token_id': str, 'condition_id': str}
         o None si no se puede resolver.
+
+        Usa gamma-api.polymarket.com que devuelve:
+            outcomes:     '["Up", "Down"]'
+            clobTokenIds: '["token_up", "token_down"]'
         """
         if market_slug in self._cache:
             return self._cache[market_slug]
 
         try:
-            # La API de Polymarket permite buscar por slug
-            url = f"{self.host}/markets/{market_slug}"
-            resp = requests.get(url, timeout=10)
-
-            if resp.status_code == 404:
-                # Intentar con el endpoint de búsqueda
-                url = f"{self.host}/markets"
-                resp = requests.get(url, params={"slug": market_slug}, timeout=10)
+            url = f"{self.GAMMA_API}/markets"
+            resp = requests.get(url, params={"slug": market_slug}, timeout=10)
 
             if resp.status_code != 200:
                 log.warning("API error resolviendo %s: HTTP %d", market_slug, resp.status_code)
@@ -118,33 +117,45 @@ class MarketResolver:
 
             data = resp.json()
 
-            # Extraer token_ids de los outcomes
-            # La estructura puede variar — adaptamos a los campos comunes
-            tokens = data.get("tokens", [])
-            condition_id = data.get("condition_id", "")
+            # La API devuelve una lista — coger el primer resultado
+            if isinstance(data, list):
+                if len(data) == 0:
+                    log.warning("Mercado %s no encontrado en API", market_slug)
+                    return None
+                data = data[0]
 
-            if len(tokens) < 2:
-                log.warning("Mercado %s no tiene 2 tokens: %s", market_slug, tokens)
+            condition_id = data.get("conditionId", "")
+
+            # outcomes y clobTokenIds son strings JSON → parsear
+            outcomes_raw = data.get("outcomes", "[]")
+            tokens_raw = data.get("clobTokenIds", "[]")
+
+            outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+            token_ids = json.loads(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
+
+            if len(outcomes) != len(token_ids) or len(outcomes) < 2:
+                log.warning("Mercado %s: outcomes/tokens no válidos: %s / %s",
+                            market_slug, outcomes, token_ids)
                 return None
 
-            # Identificar UP y DOWN por el outcome name
+            # Mapear outcome → token_id
             result = {"condition_id": condition_id}
-            for token in tokens:
-                outcome = token.get("outcome", "").lower()
-                token_id = token.get("token_id", "")
-                if "up" in outcome or "yes" in outcome:
+            for outcome, token_id in zip(outcomes, token_ids):
+                key = outcome.strip().lower()
+                if key in ("up", "yes"):
                     result["up_token_id"] = token_id
-                elif "down" in outcome or "no" in outcome:
+                elif key in ("down", "no"):
                     result["down_token_id"] = token_id
 
             if "up_token_id" not in result or "down_token_id" not in result:
-                log.warning("No se encontraron tokens UP/DOWN para %s", market_slug)
+                log.warning("No se encontraron tokens UP/DOWN para %s (outcomes=%s)",
+                            market_slug, outcomes)
                 return None
 
             self._cache[market_slug] = result
             self._save_cache()
             log.info("📍 Resuelto %s → UP=%s... DOWN=%s...",
-                     market_slug, result["up_token_id"][:12], result["down_token_id"][:12])
+                     market_slug, result["up_token_id"][:16], result["down_token_id"][:16])
             return result
 
         except requests.RequestException as e:
@@ -351,7 +362,7 @@ def run(args):
         cfg["STAKE"] = args.stake
 
     # Componentes
-    resolver = MarketResolver(cfg["CLOB_HOST"])
+    resolver = MarketResolver()
     executor = PolymarketExecutor(cfg, dry_run=dry_run)
     sig_reader = SignalReader(cfg["SIGNALS_PATH"])
     exec_log = ExecutionLogger(cfg["EXEC_LOG_PATH"])
