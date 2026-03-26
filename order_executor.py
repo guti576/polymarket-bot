@@ -44,9 +44,9 @@ log = logging.getLogger("executor")
 # =============================================================================
 CFG = dict(
     # ── Polymarket API CLOB ──────────────────────────────────────────────
-    API_KEY        = "550e8400-e29b-41d4-a716-446655440000",
-    API_SECRET     = "base64EncodedSecretString",
-    API_PASSPHRASE = "randomPassphraseString",
+    API_KEY        = "5e35a342-02cb-a516-c07a-fe19e7421a90",
+    API_SECRET     = "GfahqsU1orpvNnxb2DRly_1YaQM9adrkODwHSVysJfI=",
+    API_PASSPHRASE = "07277fdb71680b13fae5f1e88b728616da11d1cbef350621b44dcb1a24407f21",
     PRIVATE_KEY    = "7f4eab4d4ff6348a8c0c60327b7c1d9ac9e5535a795164cf8122444bee9fe13a",        # sin 0x
 
     # ── Red ──────────────────────────────────────────────────────────────
