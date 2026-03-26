@@ -54,7 +54,7 @@ CFG = dict(
     CHAIN_ID       = 137,                          # Polygon mainnet
 
     # ── Trading ──────────────────────────────────────────────────────────
-    STAKE          = 2.0,      # USDC por trade
+    STAKE          = 10.0,      # USDC por trade
     SLIPPAGE       = 0.03,      # 3% slippage máximo para market orders
 
     # ── Paths ────────────────────────────────────────────────────────────
@@ -209,48 +209,63 @@ class PolymarketExecutor:
             log.error("Error inicializando ClobClient: %s", e)
             raise
 
-    def buy_shares(self, token_id: str, amount_usdc: float) -> dict:
+    def buy_shares(self, token_id: str, amount_usdc: float, price: float) -> dict:
         """
-        Compra shares por valor de amount_usdc.
-        Market order = limit order a precio alto (1.0 - slippage no aplica, compramos al ask).
+        Compra shares.
+        Market order = limit agresiva a precio alto para fill inmediato.
+        price = ask actual del snapshot (la usamos con slippage como limit).
         """
         if self.dry_run:
             return {"status": "DRY_RUN", "token_id": token_id, "amount": amount_usdc}
 
         try:
+            from py_clob_client.clob_types import OrderArgs
             from py_clob_client.order_builder.constants import BUY
 
-            # Market buy: ponemos un limit alto para que se llene inmediatamente
-            order = self.client.create_and_post_order(
+            # Precio limit = ask + slippage (agresivo para fill inmediato)
+            limit_price = min(round(price + self.cfg["SLIPPAGE"], 2), 0.99)
+            # Size en shares = USDC / price
+            size = round(amount_usdc / price, 2)
+
+            order_args = OrderArgs(
                 token_id=token_id,
+                price=limit_price,
+                size=size,
                 side=BUY,
-                size=amount_usdc,
-                price=1.0 - self.cfg["SLIPPAGE"],  # precio agresivo
             )
-            return {"status": "EXECUTED", "order": order}
+            signed_order = self.client.create_order(order_args)
+            resp = self.client.post_order(signed_order)
+            return {"status": "EXECUTED", "order": resp}
 
         except Exception as e:
             log.error("Error ejecutando BUY: %s", e)
             return {"status": "ERROR", "error": str(e)}
 
-    def sell_shares(self, token_id: str, size: float) -> dict:
+    def sell_shares(self, token_id: str, size: float, price: float) -> dict:
         """
-        Vende shares. Size = nº de shares (no USDC).
-        Market sell = limit order a precio bajo para fill inmediato.
+        Vende shares.
+        Market sell = limit agresiva a precio bajo para fill inmediato.
+        price = bid actual del snapshot.
         """
         if self.dry_run:
             return {"status": "DRY_RUN", "token_id": token_id, "size": size}
 
         try:
+            from py_clob_client.clob_types import OrderArgs
             from py_clob_client.order_builder.constants import SELL
 
-            order = self.client.create_and_post_order(
+            # Precio limit = bid - slippage (agresivo para fill inmediato)
+            limit_price = max(round(price - self.cfg["SLIPPAGE"], 2), 0.01)
+
+            order_args = OrderArgs(
                 token_id=token_id,
+                price=limit_price,
+                size=round(size, 2),
                 side=SELL,
-                size=size,
-                price=self.cfg["SLIPPAGE"],  # precio agresivo bajo para fill
             )
-            return {"status": "EXECUTED", "order": order}
+            signed_order = self.client.create_order(order_args)
+            resp = self.client.post_order(signed_order)
+            return {"status": "EXECUTED", "order": resp}
 
         except Exception as e:
             log.error("Error ejecutando SELL: %s", e)
@@ -415,7 +430,7 @@ def run(args):
                              "BUY" if not dry_run else "DRY_BUY",
                              direction, mkt, entry_ask, shares, stake)
 
-                    result = executor.buy_shares(token_id, stake)
+                    result = executor.buy_shares(token_id, stake, entry_ask)
 
                     # Registrar posición
                     positions.open(mkt, direction, token_id, shares, entry_ask)
@@ -466,7 +481,7 @@ def run(args):
                              signal.replace("EXIT_", ""), mkt,
                              exit_bid, shares, entry_ask)
 
-                    result = executor.sell_shares(token_id, shares)
+                    result = executor.sell_shares(token_id, shares, exit_bid)
 
                     positions.close(mkt)
 

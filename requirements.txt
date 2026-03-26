@@ -7,3 +7,4 @@ requests
 seaborn
 lightgbm
 tqdm
+py_clob_client
